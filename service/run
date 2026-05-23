@@ -1,4 +1,4 @@
 #!/bin/sh
 echo "*** starting Dynamic Transfer Switch With Auto Current ***"
 exec 2>&1
-exec /data/apps/dynamic_transferswitch/dynamic_transferswitch.py
+exec /data/apps/generator/generator.py
