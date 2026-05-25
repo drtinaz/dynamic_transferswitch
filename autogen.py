@@ -349,7 +349,7 @@ class DynamicTransferSwitch:
         GLib.timeout_add_seconds(60, self._monitor_lock_health)
         
         # Add periodic status reporting (every 300 seconds - 5 minutes)
-        GLib.timeout_add_seconds(300, self._periodic_status)
+        GLib.timeout_add_seconds(900, self._periodic_status)
     
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -649,14 +649,14 @@ class DynamicTransferSwitch:
         if service_name in self.properties_matches:
             return
         
-        # Subscribe to PropertiesChanged on the Temperature path
+        # Subscribe to PropertiesChanged on all paths, filter in handler
         try:
             match = self.bus.add_signal_receiver(
                 lambda *args, **kwargs: self._on_properties_changed(*args, **kwargs, service_name=service_name),
                 bus_name=service_name,
-                path="/Temperature",
                 dbus_interface="com.victronenergy.BusItem",
                 signal_name="PropertiesChanged",
+                path_keyword='path',  # This puts the path in kwargs['path']
                 sender_keyword='sender_name'
             )
             self.properties_matches[service_name] = match
@@ -707,7 +707,7 @@ class DynamicTransferSwitch:
                     logging.error(f"Error in ItemsChanged callback: {e}")
     
     def _on_properties_changed(self, *args, **kwargs):
-        """Handle PropertiesChanged signals for temperature sensors"""
+        """Handle PropertiesChanged signals for temperature sensors - ONLY process /Temperature path"""
         service_name = kwargs.get('service_name')
         if not service_name or service_name not in self.items_changed_services:
             return
@@ -715,13 +715,21 @@ class DynamicTransferSwitch:
         if not self.startup_sync_complete:
             return
         
+        # Get the path from kwargs (set by path_keyword='path')
+        path = kwargs.get('path')
+        
+        # ONLY process Temperature path, ignore RawValue and others
+        if path != TEMPERATURE_PATH:
+            logging.debug(f"PropertiesChanged ignoring {service_name} path: {path} (only processing {TEMPERATURE_PATH})")
+            return
+        
         if args and len(args) > 0:
             changes = args[0]
             if isinstance(changes, dict) and 'Value' in changes:
                 value = changes['Value']
                 service_info = self.items_changed_services[service_name]
-                logging.debug(f"PropertiesChanged for {service_name}: Temperature = {value}")
-                service_info['callback']("/Temperature", value)
+                logging.debug(f"PropertiesChanged for {service_name} - Temperature = {value}")
+                service_info['callback'](path, value)
     
     def _on_name_owner_changed(self, name, old_owner, new_owner):
         """Handle service appearance/disappearance with enhanced logging"""
@@ -1477,7 +1485,10 @@ class DynamicTransferSwitch:
     
     def _on_outdoor_temp_value(self, path, value):
         """Handle outdoor temperature value changes"""
+        
+        # Only process Temperature path
         if path != TEMPERATURE_PATH:
+            logging.debug(f"Ignoring non-Temperature path for outdoor sensor: {path}")
             return
         
         if value is None:
@@ -1511,18 +1522,16 @@ class DynamicTransferSwitch:
                 logging.debug(f"Outdoor temp changed significantly: {old_temp:.2f}F -> {temp_f:.2f}F - will trigger derating after startup")
         else:
             # Update value but log that it didn't trigger derating
-            old_temp = self.outdoor_temp_fahrenheit
             self.outdoor_temp_fahrenheit = temp_f
             logging.debug(f"Outdoor temp change below threshold ({abs(temp_f - old_raw):.3f}F < {SENSOR_CHANGE_THRESHOLD}F) - no derating triggered")
     
     def _on_generator_temp_value(self, path, value):
         """Handle generator temperature value changes"""
+        
+        # Only process Temperature path
         if path != TEMPERATURE_PATH:
-            # Log unexpected paths but don't ignore if they contain temperature data
-            logging.debug(f"Generator temp callback with path: {path}, value: {value}")
-            # Still process if it's likely a temperature value
-            if not isinstance(value, (int, float)):
-                return
+            logging.debug(f"Ignoring non-Temperature path for generator sensor: {path}")
+            return
         
         if value is None:
             logging.warning("Received None value for generator temperature")
@@ -1531,14 +1540,20 @@ class DynamicTransferSwitch:
         try:
             # Handle both direct values and nested structures
             if isinstance(value, dict) and 'Value' in value:
-                temp_c = float(value['Value'])
+                temp_raw = value['Value']
             else:
-                temp_c = float(value)
-        except (ValueError, TypeError):
-            logging.error(f"Invalid generator temperature value: {value}")
+                temp_raw = value
+            
+            # Temperature in Celsius from the sensor
+            temp_c = float(temp_raw)
+            
+            # Convert to Fahrenheit
+            temp_f = (temp_c * 9/5) + 32
+            
+        except (ValueError, TypeError) as e:
+            logging.error(f"Invalid generator temperature value: {value}, error: {e}")
             return
         
-        temp_f = (temp_c * 9/5) + 32
         old_raw = self.last_generator_temp_raw
         
         # Calculate precise change
@@ -1553,13 +1568,12 @@ class DynamicTransferSwitch:
             self.last_generator_temp_raw = temp_f
             
             if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
-                logging.debug(f"Generator temp changed significantly: {old_temp:.2f}F -> {temp_f:.2f}F (change: {temp_f - old_temp:+.2f}F) - triggering derating")
+                logging.debug(f"Generator temp changed significantly: {old_temp:.1f}F -> {temp_f:.1f}F (change: {temp_f - old_temp:+.1f}F) - triggering derating")
                 GLib.idle_add(self._trigger_derating)
             elif self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
                 logging.debug(f"Generator temp changed significantly: {old_temp:.2f}F -> {temp_f:.2f}F - will trigger derating after startup")
         else:
             # Update value but log that it didn't trigger derating
-            old_temp = self.generator_temp_fahrenheit
             self.generator_temp_fahrenheit = temp_f
             logging.debug(f"Generator temp change below threshold ({abs(temp_f - old_raw):.3f}F < {SENSOR_CHANGE_THRESHOLD}F) - no derating triggered")
     
@@ -1866,7 +1880,6 @@ class DynamicTransferSwitch:
             
             if current is None or abs(float(current) - derated) > 0.05 or force:
                 self._set_dbus_value(service, target_path, derated)
-                # Use DEBUG for derate messages (INFO only for transfers)
                 logging.debug(f"Derated {desc} to {derated}A (temp: {self.outdoor_temp_fahrenheit:.1f}F, alt: {self.altitude_feet:.0f}ft, gen_temp: {self.generator_temp_fahrenheit:.1f}F)")
                 
                 if target_path == GENERATOR_CURRENT_LIMIT_PATH:
