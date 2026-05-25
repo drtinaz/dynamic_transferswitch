@@ -8,3 +8,5 @@ v0.5
   changede service name and changed from polling to signal monitoring
 v0.6
   reduce log spamming
+v1.0
+  first production release
